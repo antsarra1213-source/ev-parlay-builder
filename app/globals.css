@@ -4,14 +4,6 @@
   --background: #ffffff;
   --foreground: #171717;
 }
-
-@theme inline {
-  --color-background: var(--background);
-  --color-foreground: var(--foreground);
-  --font-sans: var(--font-geist-sans);
-  --font-mono: var(--font-geist-mono);
-}
-
 @media (prefers-color-scheme: dark) {
   :root {
     --background: #0a0a0a;
@@ -23,4 +15,58 @@ body {
   background: var(--background);
   color: var(--foreground);
   font-family: Arial, Helvetica, sans-serif;
+}
+/* --- Legs grid: desktop layout, mobile stack --- */
+
+.legsHeaderGrid,
+.legRowGrid {
+  display: grid;
+  grid-template-columns: 60px 1.15fr 1.15fr 1.15fr 1.1fr 1fr 90px;
+  gap: 10px;
+}
+
+.removeHeaderCell {
+  text-align: right;
+}
+
+.removeCell {
+  text-align: right;
+  padding-top: 6px;
+}
+
+/* Hide helper labels on desktop */
+.mobileLabel {
+  display: none;
+  font-size: 12px;
+  color: var(--muted);
+  margin-bottom: 6px;
+}
+
+/* Mobile: stack cleanly + fix Remove button */
+@media (max-width: 768px) {
+  .legsHeaderGrid {
+    display: none;
+  }
+
+  .legRowGrid {
+    grid-template-columns: 1fr;
+    gap: 12px;
+  }
+
+  .legNumCell {
+    padding-top: 0 !important;
+    font-weight: 800;
+    color: var(--text) !important;
+  }
+
+  .removeCell {
+    width: 100%;
+    text-align: right;
+    padding-top: 0;
+  }
+
+  /* Show labels above each input on mobile (since headers are hidden) */
+  .mobileLabel {
+    display: block;
+  }
 }

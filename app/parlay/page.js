@@ -4,7 +4,6 @@ import { useEffect, useMemo, useState } from "react";
 import Link from "next/link";
 
 const DEFAULT_ASSUMED_VIG_PCT = 7;
-const DEFAULT_STAKE = 10;
 
 const clamp = (x, lo, hi) => Math.min(hi, Math.max(lo, x));
 
@@ -82,16 +81,16 @@ export default function ParlayPage() {
   const [totalParlayOdds, setTotalParlayOdds] = useState("");
   const [totalTouched, setTotalTouched] = useState(false);
 
-  const [assumedVigPct, setAssumedVigPct] = useState(String(DEFAULT_ASSUMED_VIG_PCT));
-  const [assumedVigTouched, setAssumedVigTouched] = useState(false);
-
   const [boostPct, setBoostPct] = useState("");
   const [boostTouched, setBoostTouched] = useState(false);
 
-  const [stake, setStake] = useState(String(DEFAULT_STAKE));
+  const [stake, setStake] = useState("10");
   const [stakeTouched, setStakeTouched] = useState(false);
 
-  // Load from URL hash if present
+  const [assumedVigPct, setAssumedVigPct] = useState(String(DEFAULT_ASSUMED_VIG_PCT));
+  const [assumedVigTouched, setAssumedVigTouched] = useState(false);
+
+  // Load from URL hash if present (only when a #hash exists)
   useEffect(() => {
     if (typeof window === "undefined") return;
     const hash = window.location.hash?.replace("#", "");
@@ -112,10 +111,9 @@ export default function ParlayPage() {
     }
     if (decoded.oddsMode) setOddsMode(decoded.oddsMode);
     if (decoded.totalParlayOdds !== undefined) setTotalParlayOdds(decoded.totalParlayOdds ?? "");
-    if (decoded.assumedVigPct !== undefined)
-      setAssumedVigPct(decoded.assumedVigPct ?? String(DEFAULT_ASSUMED_VIG_PCT));
     if (decoded.boostPct !== undefined) setBoostPct(decoded.boostPct ?? "");
-    if (decoded.stake !== undefined) setStake(decoded.stake ?? String(DEFAULT_STAKE));
+    if (decoded.assumedVigPct !== undefined) setAssumedVigPct(decoded.assumedVigPct ?? String(DEFAULT_ASSUMED_VIG_PCT));
+    if (decoded.stake !== undefined) setStake(decoded.stake ?? "10");
   }, []);
 
   const assumedVigDecimal = useMemo(() => {
@@ -132,30 +130,19 @@ export default function ParlayPage() {
 
   const stakeNum = useMemo(() => {
     const n = toNumOrNull(stake);
-    if (n === null) return null;
-    return clamp(n, 0, 1_000_000);
+    if (n === null) return 10;
+    return clamp(n, 0, 1000000);
   }, [stake]);
 
   function updateLeg(i, key, value) {
-    setLegs((prev) =>
-      prev.map((leg, idx) => (idx !== i ? leg : { ...leg, [key]: value }))
-    );
-  }
-
-  // mark touched on first interaction (change)
-  function touchOnChange(i, key) {
-    setLegs((prev) =>
-      prev.map((leg, idx) => {
-        if (idx !== i) return leg;
-        if (leg.touched[key]) return leg;
-        return { ...leg, touched: { ...leg.touched, [key]: true } };
-      })
-    );
+    setLegs((prev) => prev.map((leg, idx) => (idx !== i ? leg : { ...leg, [key]: value })));
   }
 
   function setTouched(i, key) {
     setLegs((prev) =>
-      prev.map((leg, idx) => (idx !== i ? leg : { ...leg, touched: { ...leg.touched, [key]: true } }))
+      prev.map((leg, idx) =>
+        idx !== i ? leg : { ...leg, touched: { ...leg.touched, [key]: true } }
+      )
     );
   }
 
@@ -164,23 +151,28 @@ export default function ParlayPage() {
   }
 
   function removeLeg(i) {
-    setLegs((prev) => (prev.length <= 1 ? prev : prev.filter((_, idx) => idx !== i)));
+    setLegs((prev) => {
+      if (prev.length <= 1) return prev;
+      return prev.filter((_, idx) => idx !== i);
+    });
   }
 
   function clearAll() {
     setLegs([makeLeg(), makeLeg()]);
     setOddsMode("PER_LEG");
     setTotalParlayOdds("");
-    setTotalTouched(false);
     setBoostPct("");
-    setBoostTouched(false);
     setAssumedVigPct(String(DEFAULT_ASSUMED_VIG_PCT));
+    setStake("10");
+
+    setTotalTouched(false);
+    setBoostTouched(false);
     setAssumedVigTouched(false);
-    setStake(String(DEFAULT_STAKE));
     setStakeTouched(false);
 
+    // Clear hash too so refresh doesn't reload old state
     if (typeof window !== "undefined") {
-      window.location.hash = "";
+      history.replaceState(null, "", window.location.pathname);
     }
   }
 
@@ -211,9 +203,15 @@ export default function ParlayPage() {
       const fairAmerican = fairProb === null ? null : probToAmerican(fairProb);
       const yourDecimal = y === null ? null : americanToDecimal(y);
 
-      return { fairProb, fairAmerican, yourDecimal, usedAssumedVig };
+      return {
+        fairProb,
+        fairAmerican,
+        yourDecimal,
+        usedAssumedVig,
+      };
     });
 
+    // True parlay probability
     let trueProb = 1;
     let haveAllFair = true;
     for (const l of legsComputed) {
@@ -227,6 +225,7 @@ export default function ParlayPage() {
 
     const fairParlayAmerican = trueProb === null ? null : probToAmerican(trueProb);
 
+    // Your parlay decimal
     let yourParlayDecimal = null;
     if (oddsMode === "TOTAL") {
       const t = toNumOrNull(totalParlayOdds);
@@ -244,16 +243,18 @@ export default function ParlayPage() {
       yourParlayDecimal = ok ? dec : null;
     }
 
+    // Boost payout portion only
     const boostedDecimal =
       yourParlayDecimal === null ? null : 1 + (yourParlayDecimal - 1) * (1 + boostDecimal);
 
     const breakEvenProb = boostedDecimal === null ? null : 1 / boostedDecimal;
 
+    // EV per $1 stake
     const evPerDollar =
       trueProb === null || boostedDecimal === null ? null : trueProb * boostedDecimal - 1;
 
-    const evDollars =
-      evPerDollar === null || stakeNum === null ? null : evPerDollar * stakeNum;
+    // EV on stake $
+    const evDollars = evPerDollar === null ? null : evPerDollar * stakeNum;
 
     return {
       legsComputed,
@@ -263,8 +264,8 @@ export default function ParlayPage() {
       boostedDecimal,
       breakEvenProb,
       evPerDollar,
-      evPct: evPerDollar,
       evDollars,
+      stakeNum,
     };
   }, [legs, oddsMode, totalParlayOdds, assumedVigDecimal, boostDecimal, stakeNum]);
 
@@ -277,10 +278,9 @@ export default function ParlayPage() {
   function fieldError(leg, key) {
     const v = String(leg[key] ?? "").trim();
     if (!leg.touched[key]) return "";
-
     if (key === "sharpA") {
       if (!v) return "Required";
-      if (toNumOrNull(v) === null) return "Enter valid American odds";
+      if (toNumOrNull(v) === null) return "Enter valid American odds (ex: -110, 120)";
     }
     if (key === "sharpB") {
       if (!v) return "";
@@ -308,7 +308,7 @@ export default function ParlayPage() {
     if (!boostTouched) return "";
     if (!v) return "";
     const n = toNumOrNull(v);
-    if (n === null) return "Enter a number (example: 20)";
+    if (n === null) return "Enter a number (ex: 20)";
     if (n < 0) return "Boost cannot be negative";
     return "";
   }, [boostPct, boostTouched]);
@@ -318,7 +318,7 @@ export default function ParlayPage() {
     if (!assumedVigTouched) return "";
     if (!v) return "Required";
     const n = toNumOrNull(v);
-    if (n === null) return "Enter a number (example: 7)";
+    if (n === null) return "Enter a number (ex: 7)";
     if (n < 0 || n > 25) return "Use 0–25";
     return "";
   }, [assumedVigPct, assumedVigTouched]);
@@ -328,21 +328,24 @@ export default function ParlayPage() {
     if (!stakeTouched) return "";
     if (!v) return "Required";
     const n = toNumOrNull(v);
-    if (n === null) return "Enter a number (example: 10)";
+    if (n === null) return "Enter a number";
     if (n < 0) return "Stake cannot be negative";
     return "";
   }, [stake, stakeTouched]);
 
   function copyShareLink() {
     if (typeof window === "undefined") return;
-
     const shareState = {
       oddsMode,
       totalParlayOdds,
       boostPct,
       assumedVigPct,
       stake,
-      legs: legs.map((l) => ({ sharpA: l.sharpA, sharpB: l.sharpB, yourOdds: l.yourOdds })),
+      legs: legs.map((l) => ({
+        sharpA: l.sharpA,
+        sharpB: l.sharpB,
+        yourOdds: l.yourOdds,
+      })),
     };
     const hash = encodeStateToHash(shareState);
     const url = `${window.location.origin}${window.location.pathname}#${hash}`;
@@ -350,9 +353,11 @@ export default function ParlayPage() {
     alert("Share link copied!");
   }
 
-  const resultsReady = calc.trueProb !== null && calc.boostedDecimal !== null;
-
-  const containerStyle = { maxWidth: 1100, margin: "0 auto", padding: "18px 18px 48px" };
+  const containerStyle = {
+    maxWidth: 1100,
+    margin: "0 auto",
+    padding: "28px 18px 48px",
+  };
 
   const cardStyle = {
     background: "linear-gradient(180deg, rgba(255,255,255,0.06), rgba(255,255,255,0.03))",
@@ -363,7 +368,6 @@ export default function ParlayPage() {
   };
 
   const labelStyle = { fontSize: 12, color: "var(--muted)", marginBottom: 6 };
-
   const inputStyle = {
     width: "100%",
     padding: "10px 12px",
@@ -384,31 +388,30 @@ export default function ParlayPage() {
       background: "rgba(255,255,255,0.06)",
       color: "var(--text)",
       cursor: "pointer",
-      whiteSpace: "nowrap",
     };
     if (variant === "primary") {
-      return { ...base, background: "rgba(59,130,246,0.25)", border: "1px solid rgba(59,130,246,0.45)" };
+      return {
+        ...base,
+        background: "rgba(59,130,246,0.25)",
+        border: "1px solid rgba(59,130,246,0.45)",
+      };
     }
     if (variant === "danger") {
-      return { ...base, background: "rgba(239,68,68,0.18)", border: "1px solid rgba(239,68,68,0.35)" };
+      return {
+        ...base,
+        background: "rgba(239,68,68,0.18)",
+        border: "1px solid rgba(239,68,68,0.35)",
+      };
     }
     return base;
   };
 
+  const resultsReady = calc.trueProb !== null && calc.boostedDecimal !== null;
+
   return (
     <main style={containerStyle}>
-      <style>{`
-        @media (max-width: 900px){
-          .legsHeader, .legsRow{
-            grid-template-columns: 44px 1fr 1fr 1fr !important;
-          }
-          .hideOnMobile{ display:none !important; }
-          .removeCol{ justify-content:flex-end; }
-        }
-      `}</style>
-
-      {/* Header (compact) */}
-      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: 12, flexWrap: "wrap" }}>
+      {/* Header */}
+      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: 12 }}>
         <div>
           <h1 style={{ margin: 0, fontSize: 26, letterSpacing: 0.2 }}>EV Parlay Builder</h1>
           <div style={{ color: "var(--muted)", marginTop: 6, fontSize: 13 }}>
@@ -426,11 +429,11 @@ export default function ParlayPage() {
         </div>
       </div>
 
-      {/* Always-visible banner */}
+      {/* Always-visible top banner */}
       <div
         style={{
-          marginTop: 10,
-          padding: "10px 14px",
+          marginTop: 14,
+          padding: "12px 14px",
           borderRadius: 14,
           border: "1px solid rgba(239,68,68,0.30)",
           background: "rgba(239,68,68,0.10)",
@@ -441,108 +444,139 @@ export default function ParlayPage() {
         {topBanner}
       </div>
 
-      {/* INPUTS (FULL WIDTH on top) */}
-      <section style={{ ...cardStyle, marginTop: 14 }}>
-        <div style={{ display: "flex", justifyContent: "space-between", gap: 12, alignItems: "center", flexWrap: "wrap" }}>
-          <div style={{ fontWeight: 800, fontSize: 16 }}>Inputs</div>
-          <div style={{ display: "flex", gap: 10, flexWrap: "wrap" }}>
-            <button style={pillBtn(oddsMode === "PER_LEG" ? "primary" : "default")} onClick={() => setOddsMode("PER_LEG")}>
-              Per-leg your odds
-            </button>
-            <button style={pillBtn(oddsMode === "TOTAL" ? "primary" : "default")} onClick={() => setOddsMode("TOTAL")}>
-              Total parlay odds
-            </button>
-          </div>
-        </div>
+      {/* Controls + Results */}
+      <div style={{ marginTop: 16, display: "grid", gridTemplateColumns: "1.1fr 0.9fr", gap: 14 }}>
+        <section style={cardStyle}>
+          <div style={{ display: "flex", justifyContent: "space-between", gap: 12, alignItems: "center" }}>
+            <div style={{ fontWeight: 700 }}>Odds Input Mode</div>
 
-        <div style={{ marginTop: 14, display: "grid", gridTemplateColumns: "1fr 1fr 1fr", gap: 12 }}>
-          <div>
-            <div style={labelStyle}>Assumed Vig % (if Sharp B missing)</div>
+            <div style={{ display: "flex", gap: 10 }}>
+              <button
+                style={pillBtn(oddsMode === "PER_LEG" ? "primary" : "default")}
+                onClick={() => setOddsMode("PER_LEG")}
+              >
+                Per-leg your odds
+              </button>
+              <button
+                style={pillBtn(oddsMode === "TOTAL" ? "primary" : "default")}
+                onClick={() => setOddsMode("TOTAL")}
+              >
+                Total parlay odds
+              </button>
+            </div>
+          </div>
+
+          {/* total odds first */}
+          {oddsMode === "TOTAL" && (
+            <div style={{ marginTop: 14 }}>
+              <div style={labelStyle}>Your Total Parlay Odds (American)</div>
+              <input
+                style={inputStyle}
+                value={totalParlayOdds}
+                onChange={(e) => setTotalParlayOdds(e.target.value)}
+                onBlur={() => setTotalTouched(true)}
+                placeholder="Example: +320"
+              />
+              <div style={errorTextStyle}>{totalOddsError}</div>
+            </div>
+          )}
+
+          {/* boost + stake + vig */}
+          <div style={{ marginTop: 14, display: "grid", gridTemplateColumns: "1fr 1fr", gap: 12 }}>
+            <div>
+              <div style={labelStyle}>Boost % (optional)</div>
+              <input
+                style={inputStyle}
+                value={boostPct}
+                onChange={(e) => setBoostPct(e.target.value)}
+                onBlur={() => setBoostTouched(true)}
+                placeholder="Example: 20"
+              />
+              <div style={errorTextStyle}>{boostError}</div>
+            </div>
+
+            <div>
+              <div style={labelStyle}>Stake ($)</div>
+              <input
+                style={inputStyle}
+                value={stake}
+                onChange={(e) => setStake(e.target.value)}
+                onBlur={() => setStakeTouched(true)}
+                placeholder="Example: 10"
+              />
+              <div style={errorTextStyle}>{stakeError}</div>
+            </div>
+          </div>
+
+          <div style={{ marginTop: 10 }}>
+            <div style={labelStyle}>Assumed Vig % when Sharp B missing</div>
             <input
               style={inputStyle}
               value={assumedVigPct}
-              onChange={(e) => {
-                if (!assumedVigTouched) setAssumedVigTouched(true);
-                setAssumedVigPct(e.target.value);
-              }}
+              onChange={(e) => setAssumedVigPct(e.target.value)}
               onBlur={() => setAssumedVigTouched(true)}
               placeholder="Example: 7"
             />
             <div style={errorTextStyle}>{vigError}</div>
           </div>
+        </section>
 
-          <div>
-            <div style={labelStyle}>Stake ($)</div>
-            <input
-              style={inputStyle}
-              value={stake}
-              onChange={(e) => {
-                if (!stakeTouched) setStakeTouched(true);
-                setStake(e.target.value);
-              }}
-              onBlur={() => setStakeTouched(true)}
-              placeholder="Example: 10"
+        <section style={cardStyle}>
+          <div style={{ fontWeight: 700, marginBottom: 10 }}>Results</div>
+
+          <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 10 }}>
+            <ResultTile label="True Parlay Probability" value={resultsReady ? formatPct(calc.trueProb) : "—"} />
+            <ResultTile label="Fair Parlay Odds" value={resultsReady ? formatAmerican(calc.fairParlayAmerican) : "—"} />
+
+            <ResultTile
+              label="Your Parlay Odds"
+              value={
+                calc.yourParlayDecimal === null
+                  ? "—"
+                  : formatAmerican(probToAmerican(1 / clamp(calc.yourParlayDecimal, 1e-9, 1e9)))
+              }
             />
-            <div style={errorTextStyle}>{stakeError}</div>
+            <ResultTile
+              label="Boosted Parlay Odds"
+              value={
+                calc.boostedDecimal === null
+                  ? "—"
+                  : formatAmerican(probToAmerican(1 / clamp(calc.boostedDecimal, 1e-9, 1e9)))
+              }
+            />
+
+            <ResultTile label="Break-even Probability" value={calc.breakEvenProb === null ? "—" : formatPct(calc.breakEvenProb)} />
+            <ResultTile
+              label={`EV $ (stake: $${calc.stakeNum})`}
+              value={calc.evDollars === null ? "—" : formatMoney(calc.evDollars)}
+              tone={calc.evDollars === null ? "neutral" : calc.evDollars >= 0 ? "good" : "bad"}
+            />
+
+            <ResultTile
+              label="EV %"
+              value={calc.evPerDollar === null ? "—" : `${(calc.evPerDollar * 100).toFixed(2)}%`}
+              tone={calc.evPerDollar === null ? "neutral" : calc.evPerDollar >= 0 ? "good" : "bad"}
+            />
+            <ResultTile
+              label="Status"
+              value={resultsReady ? (calc.evPerDollar >= 0 ? "✅ +EV" : "❌ -EV") : "Enter inputs to calculate"}
+              tone={resultsReady ? (calc.evPerDollar >= 0 ? "good" : "bad") : "neutral"}
+            />
           </div>
+        </section>
+      </div>
 
-          {/* Keep this slot for TOTAL odds or a helpful placeholder */}
-          <div>
-            {oddsMode === "TOTAL" ? (
-              <>
-                <div style={labelStyle}>Your Total Parlay Odds (American)</div>
-                <input
-                  style={inputStyle}
-                  value={totalParlayOdds}
-                  onChange={(e) => {
-                    if (!totalTouched) setTotalTouched(true);
-                    setTotalParlayOdds(e.target.value);
-                  }}
-                  onBlur={() => setTotalTouched(true)}
-                  placeholder="Example: +320"
-                />
-                <div style={errorTextStyle}>{totalOddsError}</div>
-              </>
-            ) : (
-              <>
-                <div style={labelStyle}>Total Parlay Odds</div>
-                <div style={{ ...inputStyle, display: "flex", alignItems: "center", opacity: 0.65 }}>
-                  (Calculated from leg odds)
-                </div>
-                <div style={errorTextStyle} />
-              </>
-            )}
-          </div>
-        </div>
-
-        {/* ✅ Boost BELOW the total odds area (as requested) */}
-        <div style={{ marginTop: 6, maxWidth: 360 }}>
-          <div style={labelStyle}>Boost % (optional)</div>
-          <input
-            style={inputStyle}
-            value={boostPct}
-            onChange={(e) => {
-              if (!boostTouched) setBoostTouched(true);
-              setBoostPct(e.target.value);
-            }}
-            onBlur={() => setBoostTouched(true)}
-            placeholder="Example: 20"
-          />
-          <div style={errorTextStyle}>{boostError}</div>
-        </div>
-      </section>
-
-      {/* LEGS (next) */}
+      {/* Legs */}
       <section style={{ ...cardStyle, marginTop: 14 }}>
-        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: 12, flexWrap: "wrap" }}>
+        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: 12 }}>
           <div>
-            <div style={{ fontWeight: 800, fontSize: 16 }}>Legs</div>
+            <div style={{ fontWeight: 700 }}>Legs</div>
             <div style={{ fontSize: 13, color: "var(--muted)", marginTop: 4 }}>
               Sharp A required. Sharp B optional. Your odds required in per-leg mode.
             </div>
           </div>
 
-          <div style={{ display: "flex", gap: 10, flexWrap: "wrap" }}>
+          <div style={{ display: "flex", gap: 10 }}>
             <button onClick={clearAll} style={pillBtn()}>
               Clear All
             </button>
@@ -552,32 +586,26 @@ export default function ParlayPage() {
           </div>
         </div>
 
-        {/* Column headers */}
-        <div
-          className="legsHeader"
-          style={{
-            marginTop: 14,
-            display: "grid",
-            gridTemplateColumns: "60px 1.15fr 1.15fr 1.15fr 1.1fr 1fr 90px",
-            gap: 10,
-            padding: "10px 10px",
-            borderRadius: 12,
-            border: "1px solid var(--border)",
-            background: "rgba(0,0,0,0.14)",
-            color: "var(--muted)",
-            fontSize: 12,
-          }}
-        >
+        {/* HEADERS (hidden on mobile via CSS) */}
+        <div className="legsHeaderGrid" style={{
+          marginTop: 14,
+          padding: "10px 10px",
+          borderRadius: 12,
+          border: "1px solid var(--border)",
+          background: "rgba(0,0,0,0.14)",
+          color: "var(--muted)",
+          fontSize: 12,
+        }}>
           <div>#</div>
-          <div>Sharp Side A</div>
-          <div>Sharp Side B</div>
-          <div>{oddsMode === "PER_LEG" ? "Your Odds" : "Your Odds (ignored)"}</div>
-          <div className="hideOnMobile">Leg True Prob</div>
-          <div className="hideOnMobile">Leg Fair Odds</div>
-          <div style={{ textAlign: "right" }}>Remove</div>
+          <div>Sharp Side A (American)</div>
+          <div>Sharp Side B (Optional)</div>
+          <div>{oddsMode === "PER_LEG" ? "Your Odds (American)" : "Your Odds (ignored in TOTAL mode)"}</div>
+          <div>Leg True Prob</div>
+          <div>Leg Fair Odds</div>
+          <div className="removeHeaderCell">Remove</div>
         </div>
 
-        {/* Rows */}
+        {/* ROWS */}
         <div style={{ marginTop: 10, display: "flex", flexDirection: "column", gap: 10 }}>
           {legs.map((leg, i) => {
             const computed = calc.legsComputed[i];
@@ -588,11 +616,8 @@ export default function ParlayPage() {
             return (
               <div
                 key={i}
-                className="legsRow"
+                className="legRowGrid"
                 style={{
-                  display: "grid",
-                  gridTemplateColumns: "60px 1.15fr 1.15fr 1.15fr 1.1fr 1fr 90px",
-                  gap: 10,
                   padding: "10px 10px",
                   borderRadius: 12,
                   border: "1px solid var(--border)",
@@ -600,16 +625,16 @@ export default function ParlayPage() {
                   alignItems: "start",
                 }}
               >
-                <div style={{ paddingTop: 10, color: "var(--muted)" }}>{i + 1}</div>
+                <div className="legNumCell" style={{ paddingTop: 10, color: "var(--muted)" }}>
+                  {i + 1}
+                </div>
 
                 <div>
+                  <div className="mobileLabel">Sharp Side A (required)</div>
                   <input
                     style={inputStyle}
                     value={leg.sharpA}
-                    onChange={(e) => {
-                      touchOnChange(i, "sharpA");
-                      updateLeg(i, "sharpA", e.target.value);
-                    }}
+                    onChange={(e) => updateLeg(i, "sharpA", e.target.value)}
                     onBlur={() => setTouched(i, "sharpA")}
                     placeholder="Example: -110"
                   />
@@ -617,13 +642,11 @@ export default function ParlayPage() {
                 </div>
 
                 <div>
+                  <div className="mobileLabel">Sharp Side B (optional)</div>
                   <input
                     style={inputStyle}
                     value={leg.sharpB}
-                    onChange={(e) => {
-                      touchOnChange(i, "sharpB");
-                      updateLeg(i, "sharpB", e.target.value);
-                    }}
+                    onChange={(e) => updateLeg(i, "sharpB", e.target.value)}
                     onBlur={() => setTouched(i, "sharpB")}
                     placeholder="Optional: +100"
                   />
@@ -631,13 +654,11 @@ export default function ParlayPage() {
                 </div>
 
                 <div>
+                  <div className="mobileLabel">{oddsMode === "PER_LEG" ? "Your Odds" : "Your Odds (ignored)"}</div>
                   <input
                     style={{ ...inputStyle, opacity: oddsMode === "TOTAL" ? 0.6 : 1 }}
                     value={leg.yourOdds}
-                    onChange={(e) => {
-                      touchOnChange(i, "yourOdds");
-                      updateLeg(i, "yourOdds", e.target.value);
-                    }}
+                    onChange={(e) => updateLeg(i, "yourOdds", e.target.value)}
                     onBlur={() => setTouched(i, "yourOdds")}
                     placeholder={oddsMode === "TOTAL" ? "Ignored in TOTAL mode" : "Example: +120"}
                     disabled={oddsMode === "TOTAL"}
@@ -645,21 +666,24 @@ export default function ParlayPage() {
                   <div style={errorTextStyle}>{errY}</div>
                 </div>
 
-                <div className="hideOnMobile" style={{ paddingTop: 10 }}>
-                  <div style={{ fontWeight: 800 }}>{computed?.fairProb === null ? "—" : formatPct(computed.fairProb)}</div>
+                <div style={{ paddingTop: 10 }}>
+                  <div className="mobileLabel">Leg True Prob</div>
+                  <div style={{ fontWeight: 700 }}>{computed?.fairProb === null ? "—" : formatPct(computed.fairProb)}</div>
                   <div style={{ fontSize: 12, color: "var(--muted)", marginTop: 4 }}>
-                    {computed?.usedAssumedVig ? `Assumed vig (${(assumedVigDecimal * 100).toFixed(1)}%)` : "Devig (two-sided)"}
+                    {computed?.usedAssumedVig
+                      ? `Assumed vig used (${(assumedVigDecimal * 100).toFixed(1)}%)`
+                      : "Devig (two-sided)"}
                   </div>
                 </div>
 
-                <div className="hideOnMobile" style={{ paddingTop: 10 }}>
-                  <div style={{ fontWeight: 800 }}>
-                    {computed?.fairAmerican === null ? "—" : formatAmerican(computed.fairAmerican)}
-                  </div>
-                  <div style={{ fontSize: 12, color: "var(--muted)", marginTop: 4 }}>Fair odds</div>
+                <div style={{ paddingTop: 10 }}>
+                  <div className="mobileLabel">Leg Fair Odds</div>
+                  <div style={{ fontWeight: 700 }}>{computed?.fairAmerican === null ? "—" : formatAmerican(computed.fairAmerican)}</div>
+                  <div style={{ fontSize: 12, color: "var(--muted)", marginTop: 4 }}>Fair odds from true prob</div>
                 </div>
 
-                <div className="removeCol" style={{ textAlign: "right", paddingTop: 6, display: "flex", justifyContent: "flex-end" }}>
+                {/* THIS is the cell we fix on mobile */}
+                <div className="removeCell">
                   <button
                     onClick={() => removeLeg(i)}
                     style={pillBtn("danger")}
@@ -679,49 +703,6 @@ export default function ParlayPage() {
         </div>
       </section>
 
-      {/* RESULTS (full width at bottom) */}
-      <section style={{ ...cardStyle, marginTop: 14 }}>
-        <div style={{ fontWeight: 800, fontSize: 16, marginBottom: 10 }}>Results</div>
-
-        <div style={{ display: "grid", gridTemplateColumns: "repeat(4, minmax(0, 1fr))", gap: 10 }}>
-          <ResultTile label="True Parlay Probability" value={resultsReady ? formatPct(calc.trueProb) : "—"} />
-          <ResultTile label="Fair Parlay Odds" value={resultsReady ? formatAmerican(calc.fairParlayAmerican) : "—"} />
-          <ResultTile
-            label="Your Parlay Odds"
-            value={
-              calc.yourParlayDecimal === null
-                ? "—"
-                : formatAmerican(probToAmerican(1 / clamp(calc.yourParlayDecimal, 1e-9, 1e9)))
-            }
-          />
-          <ResultTile
-            label="Boosted Parlay Odds"
-            value={
-              calc.boostedDecimal === null
-                ? "—"
-                : formatAmerican(probToAmerican(1 / clamp(calc.boostedDecimal, 1e-9, 1e9)))
-            }
-          />
-          <ResultTile label="Break-even Probability" value={calc.breakEvenProb === null ? "—" : formatPct(calc.breakEvenProb)} />
-          {/* ✅ replaced EV per $1 with EV $ (stake) */}
-          <ResultTile
-            label={`EV $ (stake: $${stakeNum ?? "—"})`}
-            value={calc.evDollars === null ? "—" : formatMoney(calc.evDollars)}
-            tone={calc.evDollars === null ? "neutral" : calc.evDollars >= 0 ? "good" : "bad"}
-          />
-          <ResultTile
-            label="EV %"
-            value={calc.evPct === null ? "—" : `${(calc.evPct * 100).toFixed(2)}%`}
-            tone={calc.evPct === null ? "neutral" : calc.evPct >= 0 ? "good" : "bad"}
-          />
-          <ResultTile
-            label="Status"
-            value={resultsReady ? (calc.evPerDollar >= 0 ? "✅ +EV" : "❌ -EV") : "Enter inputs to calculate"}
-            tone={resultsReady ? (calc.evPerDollar >= 0 ? "good" : "bad") : "neutral"}
-          />
-        </div>
-      </section>
-
       <footer style={{ marginTop: 18, color: "var(--muted)", fontSize: 12 }}>
         This tool is for informational purposes only. Always double-check inputs.
       </footer>
@@ -738,9 +719,9 @@ function ResultTile({ label, value, tone = "neutral" }) {
       : { border: "1px solid var(--border)", background: "rgba(0,0,0,0.14)" };
 
   return (
-    <div style={{ padding: "12px 12px", borderRadius: 14, ...toneStyle, minHeight: 78 }}>
+    <div style={{ padding: "12px 12px", borderRadius: 14, ...toneStyle, minHeight: 72 }}>
       <div style={{ fontSize: 12, color: "var(--muted)" }}>{label}</div>
-      <div style={{ marginTop: 6, fontSize: 18, fontWeight: 900 }}>{value}</div>
+      <div style={{ marginTop: 6, fontSize: 18, fontWeight: 800 }}>{value}</div>
     </div>
   );
 }
