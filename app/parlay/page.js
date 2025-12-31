@@ -1,710 +1,652 @@
 "use client";
 
-import React, { useMemo, useState } from "react";
+import React, { useEffect, useMemo, useRef, useState } from "react";
 
-function toNumber(val) {
-  if (val === null || val === undefined) return null;
-  const s = String(val).trim();
-  if (!s) return null;
-  const n = Number(s);
+const DEFAULT_VIG_PCT = 7;
+const DEFAULT_STAKE = 10;
+
+const clamp = (n, min, max) => Math.min(max, Math.max(min, n));
+
+function isBlank(v) {
+  return v === null || v === undefined || String(v).trim() === "";
+}
+
+function safeNum(v) {
+  if (isBlank(v)) return null;
+  const n = Number(String(v).replaceAll(",", "").trim());
   return Number.isFinite(n) ? n : null;
 }
 
-function americanToImpliedProb(american) {
-  const a = toNumber(american);
+function americanToProb(american) {
+  const a = safeNum(american);
   if (a === null || a === 0) return null;
   if (a > 0) return 100 / (a + 100);
   return Math.abs(a) / (Math.abs(a) + 100);
 }
 
-function impliedProbToAmerican(p) {
+function probToAmerican(prob) {
+  const p = prob;
   if (!Number.isFinite(p) || p <= 0 || p >= 1) return null;
-  if (p <= 0.5) return Math.round((1 - p) * 100 / p);
-  return Math.round(-p * 100 / (1 - p));
+  if (p >= 0.5) return -Math.round((p * 100) / (1 - p));
+  return Math.round(((1 - p) * 100) / p);
 }
 
 function americanToDecimal(american) {
-  const a = toNumber(american);
+  const a = safeNum(american);
   if (a === null || a === 0) return null;
   if (a > 0) return 1 + a / 100;
   return 1 + 100 / Math.abs(a);
 }
 
-function decimalToAmerican(dec) {
-  if (!Number.isFinite(dec) || dec <= 1) return null;
-  const profit = dec - 1;
+function decimalToAmerican(decimal) {
+  const d = safeNum(decimal);
+  if (d === null || d <= 1) return null;
+  const profit = d - 1;
   if (profit >= 1) return Math.round(profit * 100);
-  return Math.round(-100 / profit);
+  return -Math.round(100 / profit);
 }
 
-function formatAmerican(a) {
-  if (a === null || a === undefined) return "—";
-  const n = Number(a);
-  if (!Number.isFinite(n)) return "—";
-  return n > 0 ? `+${n}` : `${n}`;
+function fmtAmerican(a) {
+  if (a === null || a === undefined || !Number.isFinite(a)) return "—";
+  return a > 0 ? `+${a}` : `${a}`;
 }
 
-function formatDecimalFromAmerican(a) {
-  const d = americanToDecimal(a);
-  if (!Number.isFinite(d)) return "—";
-  // show 2 decimals like books
-  return d.toFixed(2);
-}
-
-function formatPct(p) {
-  if (!Number.isFinite(p)) return "—";
+function fmtPct(p) {
+  if (p === null || p === undefined || !Number.isFinite(p)) return "—";
   return `${(p * 100).toFixed(2)}%`;
 }
 
-function clamp(n, lo, hi) {
-  return Math.max(lo, Math.min(hi, n));
+function fmtMoney(x) {
+  if (x === null || x === undefined || !Number.isFinite(x)) return "—";
+  const sign = x < 0 ? "-" : "";
+  const abs = Math.abs(x);
+  return `${sign}$${abs.toFixed(2)}`;
 }
 
-/**
- * Devig logic:
- * - If Sharp A + Sharp B present: classic 2-sided normalize.
- * - If Sharp B missing: use assumed vig% as a discount to implied probability (simple + stable).
- */
-function devigTrueProb(sharpA_Amer, sharpB_Amer, assumedVigPct) {
-  const pA = americanToImpliedProb(sharpA_Amer);
-  if (pA === null) return { p: null, note: "" };
+function encodeState(stateObj) {
+  const json = JSON.stringify(stateObj);
+  const b64 = btoa(unescape(encodeURIComponent(json)))
+    .replaceAll("+", "-")
+    .replaceAll("/", "_")
+    .replaceAll("=", "");
+  return b64;
+}
 
-  const pB = americanToImpliedProb(sharpB_Amer);
-  if (pB !== null) {
-    const total = pA + pB;
-    const q = total > 0 ? pA / total : null;
-    return { p: q, note: "Devig (two-sided)" };
+function decodeState(b64url) {
+  try {
+    const b64 = b64url.replaceAll("-", "+").replaceAll("_", "/");
+    const pad = b64.length % 4 === 0 ? "" : "=".repeat(4 - (b64.length % 4));
+    const json = decodeURIComponent(escape(atob(b64 + pad)));
+    return JSON.parse(json);
+  } catch {
+    return null;
   }
-
-  const vig = clamp((toNumber(assumedVigPct) ?? 0) / 100, 0, 0.25);
-  const q = clamp(pA * (1 - vig), 0.0001, 0.9999);
-  return { p: q, note: `Assumed vig (${(vig * 100).toFixed(1)}%)` };
 }
 
-/* ---------- Odds parsing by format ---------- */
-
-function normalizeOddsToAmerican(raw, oddsFormat) {
-  const s = String(raw ?? "").trim();
-  if (!s) return null;
-
-  if (oddsFormat === "american") {
-    const a = toNumber(s);
-    if (a === null || a === 0) return null;
-    return a;
-  }
-
-  // decimal
-  const d = toNumber(s);
-  if (d === null || d <= 1) return null;
-  return decimalToAmerican(d);
-}
-
-function isValidOdds(raw, oddsFormat) {
-  const a = normalizeOddsToAmerican(raw, oddsFormat);
-  return a !== null && Number.isFinite(a) && a !== 0;
-}
-
-function ResultTile({ labelNode, value, tone = "neutral", onCopy }) {
-  const klass =
-    tone === "good" ? "resultTile goodGlow" :
-    tone === "bad" ? "resultTile badGlow" :
-    tone === "warn" ? "resultTile warnGlow" :
-    "resultTile";
-
-  return (
-    <div className={klass}>
-      <div className="resultLabel">
-        <span>{labelNode}</span>
-        {onCopy ? (
-          <button className="copyMini" onClick={onCopy}>Copy</button>
-        ) : null}
-      </div>
-      <div className="resultValue">{value}</div>
-    </div>
-  );
-}
-
-function InfoTooltip({ title = "Info", children }) {
-  const [open, setOpen] = useState(false);
-
-  return (
-    <span className="infoWrap">
-      <button
-        type="button"
-        className="infoBtn"
-        onClick={(e) => { e.stopPropagation(); setOpen(v => !v); }}
-        aria-label={title}
-      >
-        i
-      </button>
-      {open ? (
-        <div className="infoCard" onClick={(e) => e.stopPropagation()}>
-          <div style={{ fontWeight: 950, marginBottom: 6 }}>{title}</div>
-          <div style={{ color: "rgba(255,255,255,0.86)", lineHeight: 1.35 }}>
-            {children}
-          </div>
-          <div style={{ marginTop: 10 }}>
-            <button className="pillBtn" onClick={() => setOpen(false)}>Close</button>
-          </div>
-        </div>
-      ) : null}
-    </span>
-  );
+function getShareUrlWithState(stateObj) {
+  const url = new URL(window.location.href);
+  url.searchParams.set("s", encodeState(stateObj));
+  return url.toString();
 }
 
 export default function ParlayPage() {
-  const [mode, setMode] = useState("total"); // "total" | "perLeg"
-  const [oddsFormat, setOddsFormat] = useState("american"); // "american" | "decimal"
+  const [mode, setMode] = useState("perleg");
 
-  const [assumedVigPct, setAssumedVigPct] = useState("7");
-  const [stake, setStake] = useState("10");
-  const [totalParlayOdds, setTotalParlayOdds] = useState("");
+  const [vigPct, setVigPct] = useState(DEFAULT_VIG_PCT);
+  const [stake, setStake] = useState(DEFAULT_STAKE);
   const [boostPct, setBoostPct] = useState("");
+  const [totalOdds, setTotalOdds] = useState("");
 
   const [legs, setLegs] = useState([
-    { id: crypto.randomUUID(), label: "", sharpA: "", sharpB: "", yourOdds: "" },
+    { id: crypto.randomUUID(), label: "", sharpA: "", sharpB: "", your: "" },
+    { id: crypto.randomUUID(), label: "", sharpA: "", sharpB: "", your: "" },
   ]);
 
-  const addLeg = () => {
-    setLegs(prev => [
+  const [helpOpen, setHelpOpen] = useState(false);
+  const toastRef = useRef(null);
+
+  // Load from share link
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+    const url = new URL(window.location.href);
+    const s = url.searchParams.get("s");
+    if (!s) return;
+
+    const decoded = decodeState(s);
+    if (!decoded) return;
+
+    if (decoded.mode) setMode(decoded.mode === "total" ? "total" : "perleg");
+    if (Number.isFinite(decoded.vigPct)) setVigPct(decoded.vigPct);
+    if (Number.isFinite(decoded.stake)) setStake(decoded.stake);
+    if (decoded.boostPct !== undefined) setBoostPct(decoded.boostPct);
+    if (decoded.totalOdds !== undefined) setTotalOdds(decoded.totalOdds);
+
+    if (Array.isArray(decoded.legs) && decoded.legs.length) {
+      setLegs(
+        decoded.legs.map((l) => ({
+          id: crypto.randomUUID(),
+          label: l.label ?? "",
+          sharpA: l.sharpA ?? "",
+          sharpB: l.sharpB ?? "",
+          your: l.your ?? "",
+        }))
+      );
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  function showToast(msg) {
+    if (!toastRef.current) return;
+    toastRef.current.textContent = msg;
+    toastRef.current.classList.add("show");
+    setTimeout(() => toastRef.current?.classList.remove("show"), 1800);
+  }
+
+  async function copyText(text, okMsg = "Copied") {
+    try {
+      await navigator.clipboard.writeText(text);
+      showToast(okMsg);
+    } catch {
+      showToast("Copy failed (browser blocked)");
+    }
+  }
+
+  function addLeg() {
+    setLegs((prev) => [
       ...prev,
-      { id: crypto.randomUUID(), label: "", sharpA: "", sharpB: "", yourOdds: "" },
+      { id: crypto.randomUUID(), label: "", sharpA: "", sharpB: "", your: "" },
     ]);
-  };
+  }
 
-  const removeLeg = (id) => {
-    setLegs(prev => prev.length <= 1 ? prev : prev.filter(l => l.id !== id));
-  };
-
-  const clearLegs = () => {
-    setLegs([{ id: crypto.randomUUID(), label: "", sharpA: "", sharpB: "", yourOdds: "" }]);
-  };
-
-  const clearAll = () => {
-    setMode("total");
-    setOddsFormat("american");
-    setAssumedVigPct("7");
-    setStake("10");
-    setTotalParlayOdds("");
-    setBoostPct("");
-    clearLegs();
-  };
-
-  const computed = useMemo(() => {
-    const legComputed = legs.map((l) => {
-      const sharpA_A = normalizeOddsToAmerican(l.sharpA, oddsFormat);
-      const sharpB_A = normalizeOddsToAmerican(l.sharpB, oddsFormat);
-      const your_A = normalizeOddsToAmerican(l.yourOdds, oddsFormat);
-
-      const { p, note } = devigTrueProb(sharpA_A, sharpB_A, assumedVigPct);
-      const fairA = p ? impliedProbToAmerican(p) : null;
-
-      return {
-        ...l,
-        sharpA_A,
-        sharpB_A,
-        your_A,
-        trueProb: p,
-        fairOddsA: fairA,
-        note,
-      };
+  function removeLeg(id) {
+    setLegs((prev) => {
+      const next = prev.filter((l) => l.id !== id);
+      return next.length ? next : prev;
     });
+  }
 
-    // true parlay probability = product of true probs
-    const probs = legComputed.map(x => x.trueProb).filter(p => Number.isFinite(p));
-    const trueParlayProb = probs.length === legComputed.length && probs.length > 0
-      ? probs.reduce((acc, p) => acc * p, 1)
-      : null;
+  function clearLegs() {
+    setLegs([{ id: crypto.randomUUID(), label: "", sharpA: "", sharpB: "", your: "" }]);
+    showToast("Legs cleared");
+  }
 
-    const fairParlayAmerican = trueParlayProb ? impliedProbToAmerican(trueParlayProb) : null;
+  function clearAll() {
+    setMode("perleg");
+    setVigPct(DEFAULT_VIG_PCT);
+    setStake(DEFAULT_STAKE);
+    setBoostPct("");
+    setTotalOdds("");
+    setLegs([
+      { id: crypto.randomUUID(), label: "", sharpA: "", sharpB: "", your: "" },
+      { id: crypto.randomUUID(), label: "", sharpA: "", sharpB: "", your: "" },
+    ]);
+    showToast("Cleared all");
+  }
 
-    // Your parlay odds (American)
+  const legCalcs = useMemo(() => {
+    const vig = clamp((safeNum(vigPct) ?? DEFAULT_VIG_PCT) / 100, 0, 0.25);
+
+    return legs.map((leg) => {
+      const pA = americanToProb(leg.sharpA);
+      const pB = americanToProb(leg.sharpB);
+
+      let pTrue = null;
+      let method = "";
+
+      if (pA !== null && pB !== null) {
+        const total = pA + pB;
+        if (total > 0) {
+          pTrue = clamp(pA / total, 0.000001, 0.999999);
+          method = "Devig (two-sided)";
+        }
+      } else if (pA !== null && pB === null) {
+        pTrue = clamp(pA / (1 + vig), 0.000001, 0.999999);
+        method = `Assumed vig (${(vig * 100).toFixed(1)}%)`;
+      }
+
+      const fairA = pTrue !== null ? probToAmerican(pTrue) : null;
+      const yourDec = americanToDecimal(leg.your);
+
+      return { id: leg.id, pTrue, fairA, method, yourDec };
+    });
+  }, [legs, vigPct]);
+
+  const results = useMemo(() => {
+    const stakeNum = clamp(safeNum(stake) ?? DEFAULT_STAKE, 0, 1_000_000);
+    const boost = clamp((safeNum(boostPct) ?? 0) / 100, 0, 10);
+
+    const probs = legCalcs.map((l) => l.pTrue).filter((p) => p !== null && Number.isFinite(p));
+    const trueParlayProb = probs.length > 0 ? probs.reduce((acc, p) => acc * p, 1) : null;
+
+    const fairParlayAmerican = trueParlayProb !== null ? probToAmerican(trueParlayProb) : null;
+
     let yourParlayAmerican = null;
 
     if (mode === "total") {
-      yourParlayAmerican = normalizeOddsToAmerican(totalParlayOdds, oddsFormat);
+      const a = safeNum(totalOdds);
+      if (a !== null && a !== 0) yourParlayAmerican = Math.trunc(a);
     } else {
-      // multiply decimals from each leg your odds (converted to American then to Decimal)
-      const decs = legComputed.map(x => americanToDecimal(x.your_A));
-      if (decs.every(d => Number.isFinite(d)) && decs.length > 0) {
-        const totalDec = decs.reduce((acc, d) => acc * d, 1);
-        yourParlayAmerican = decimalToAmerican(totalDec);
+      const yourDecs = legCalcs.map((l) => l.yourDec).filter((d) => d !== null && Number.isFinite(d));
+      if (yourDecs.length > 0 && yourDecs.length === legs.length) {
+        const parlayDec = yourDecs.reduce((acc, d) => acc * d, 1);
+        yourParlayAmerican = decimalToAmerican(parlayDec);
       }
     }
 
-    const boost = clamp((toNumber(boostPct) ?? 0) / 100, 0, 10);
-    const boostedAmerican = (yourParlayAmerican !== null && Number.isFinite(yourParlayAmerican) && boost > 0)
-      ? (() => {
-          const dec = americanToDecimal(yourParlayAmerican);
-          if (!dec) return null;
-          const boostedDec = 1 + (dec - 1) * (1 + boost);
-          return decimalToAmerican(boostedDec);
-        })()
-      : yourParlayAmerican;
+    let boostedAmerican = null;
+    const yourDec = yourParlayAmerican !== null ? americanToDecimal(yourParlayAmerican) : null;
+    if (yourDec !== null) {
+      const profitMultiple = yourDec - 1;
+      const boostedProfitMultiple = profitMultiple * (1 + boost);
+      const boostedDec = 1 + boostedProfitMultiple;
+      boostedAmerican = decimalToAmerican(boostedDec);
+    }
 
-    const breakEvenProb = (boostedAmerican !== null && Number.isFinite(boostedAmerican))
-      ? americanToImpliedProb(boostedAmerican)
-      : null;
+    const offeredAmerican = boost > 0 && boostedAmerican !== null ? boostedAmerican : yourParlayAmerican;
+    const offeredDec = offeredAmerican !== null ? americanToDecimal(offeredAmerican) : null;
 
-    // EV: stake * (p * payout - (1-p))
-    const st = clamp(toNumber(stake) ?? 0, 0, 1_000_000);
-    let evDollar = null;
+    const breakEvenProb = offeredDec !== null ? clamp(1 / offeredDec, 0, 1) : null;
+
+    let evDollars = null;
     let evPct = null;
-    if (Number.isFinite(trueParlayProb) && boostedAmerican !== null && Number.isFinite(boostedAmerican) && st > 0) {
-      const dec = americanToDecimal(boostedAmerican);
-      if (dec) {
-        const expected = trueParlayProb * (st * (dec - 1)) - (1 - trueParlayProb) * st;
-        evDollar = expected;
-        evPct = (expected / st) * 100;
-      }
+
+    if (trueParlayProb !== null && offeredDec !== null) {
+      const profitIfWin = stakeNum * (offeredDec - 1);
+      evDollars = trueParlayProb * profitIfWin - (1 - trueParlayProb) * stakeNum;
+      evPct = stakeNum > 0 ? evDollars / stakeNum : null;
     }
 
     const status =
-      evPct === null ? "Enter inputs to calculate" :
-      evPct > 0 ? "+EV" :
-      evPct < 0 ? "-EV" : "Neutral";
+      evPct === null ? "Enter inputs to calculate" : evPct > 0 ? "+EV" : evPct < 0 ? "-EV" : "Neutral";
 
     return {
-      legComputed,
       trueParlayProb,
       fairParlayAmerican,
       yourParlayAmerican,
       boostedAmerican,
       breakEvenProb,
-      evDollar,
+      evDollars,
       evPct,
       status,
+      stakeNum,
     };
-  }, [legs, assumedVigPct, mode, totalParlayOdds, boostPct, stake, oddsFormat]);
+  }, [legCalcs, mode, totalOdds, stake, boostPct, legs.length]);
 
-  /* ---------- Validation ---------- */
-
-  const validation = useMemo(() => {
-    const legErrors = computed.legComputed.map((l) => {
-      const sharpAOk = isValidOdds(l.sharpA, oddsFormat);
-      const sharpBOk = !String(l.sharpB ?? "").trim() ? true : isValidOdds(l.sharpB, oddsFormat);
-
-      const yourReq = mode === "perLeg";
-      const yourOk = !yourReq ? true : isValidOdds(l.yourOdds, oddsFormat);
-
-      return {
-        sharpAOk,
-        sharpBOk,
-        yourOk,
-      };
-    });
-
-    const totalOk = mode !== "total" ? true : isValidOdds(totalParlayOdds, oddsFormat);
-
-    const anyMissingSharpA = legErrors.some(e => !e.sharpAOk);
-    const anyBadSharpB = legErrors.some(e => !e.sharpBOk);
-    const anyMissingYour = legErrors.some(e => !e.yourOk);
-
+  function currentStateForShare() {
     return {
-      legErrors,
-      totalOk,
-      anyMissingSharpA,
-      anyBadSharpB,
-      anyMissingYour,
+      mode,
+      vigPct: safeNum(vigPct) ?? DEFAULT_VIG_PCT,
+      stake: safeNum(stake) ?? DEFAULT_STAKE,
+      boostPct: boostPct ?? "",
+      totalOdds: totalOdds ?? "",
+      legs: legs.map((l) => ({
+        label: l.label ?? "",
+        sharpA: l.sharpA ?? "",
+        sharpB: l.sharpB ?? "",
+        your: l.your ?? "",
+      })),
     };
-  }, [computed.legComputed, oddsFormat, mode, totalParlayOdds]);
+  }
 
-  /* ---------- Copy helpers ---------- */
-
-  const copyText = async (text) => {
-    try {
-      await navigator.clipboard.writeText(text);
-    } catch {
-      const ta = document.createElement("textarea");
-      ta.value = text;
-      document.body.appendChild(ta);
-      ta.select();
-      document.execCommand("copy");
-      document.body.removeChild(ta);
+  function buildResultsText() {
+    const lines = [];
+    lines.push("EV Parlay Builder Results");
+    lines.push(`Mode: ${mode === "total" ? "Total parlay odds" : "Per-leg your odds"}`);
+    lines.push(`Stake: $${(results.stakeNum ?? 0).toFixed(2)}`);
+    lines.push(`Assumed vig when Sharp B missing: ${Number(vigPct).toFixed(2)}%`);
+    if (safeNum(boostPct) !== null && safeNum(boostPct) > 0) {
+      lines.push(`Boost: ${Number(boostPct).toFixed(2)}% (profit portion)`);
     }
-  };
+    lines.push("");
+    lines.push(`True Parlay Probability: ${fmtPct(results.trueParlayProb)}`);
+    lines.push(`Fair Parlay Odds: ${fmtAmerican(results.fairParlayAmerican)}`);
+    lines.push(`Your Parlay Odds: ${fmtAmerican(results.yourParlayAmerican)}`);
+    lines.push(`Boosted Parlay Odds: ${fmtAmerican(results.boostedAmerican)}`);
+    lines.push(`Break-even Probability: ${fmtPct(results.breakEvenProb)}`);
+    lines.push(`EV $: ${fmtMoney(results.evDollars)}`);
+    lines.push(`EV %: ${results.evPct === null ? "—" : `${(results.evPct * 100).toFixed(2)}%`}`);
+    lines.push(`Status: ${results.status}`);
+    return lines.join("\n");
+  }
 
-  const formatOdds = (americanVal) => {
-    if (oddsFormat === "american") return formatAmerican(americanVal);
-    return formatDecimalFromAmerican(americanVal);
-  };
-
-  const copySummary = () => {
-    const lines = [
-      `EV Parlay Builder`,
-      `Mode: ${mode === "total" ? "Total parlay odds" : "Per-leg your odds"}`,
-      `Odds format: ${oddsFormat === "american" ? "American" : "Decimal"}`,
-      `Assumed vig (if Sharp B missing): ${assumedVigPct || "—"}%`,
-      `Stake: $${stake || "—"}`,
-      `Boost: ${boostPct || "0"}%`,
-      ``,
-      `True Parlay Probability: ${formatPct(computed.trueParlayProb)}`,
-      `Fair Parlay Odds: ${formatOdds(computed.fairParlayAmerican)}`,
-      `Your Parlay Odds: ${formatOdds(computed.yourParlayAmerican)}`,
-      `Boosted Parlay Odds: ${formatOdds(computed.boostedAmerican)}`,
-      `Break-even Probability: ${formatPct(computed.breakEvenProb)}`,
-      `EV $: ${computed.evDollar === null ? "—" : `$${computed.evDollar.toFixed(2)}`}`,
-      `EV %: ${computed.evPct === null ? "—" : `${computed.evPct.toFixed(2)}%`}`,
-      `Status: ${computed.status}`,
-    ];
-    copyText(lines.join("\n"));
-  };
-
-  const placeholderOdds = oddsFormat === "american" ? "Example: -160" : "Example: 1.91";
-  const placeholderYour = oddsFormat === "american" ? "Example: +110" : "Example: 2.10";
-  const placeholderTotal = oddsFormat === "american" ? "Example: +300" : "Example: 4.00";
+  const toneClass =
+    results.evPct === null ? "" : results.evPct > 0 ? "toneGood" : results.evPct < 0 ? "toneBad" : "";
 
   return (
-    <div
-      className="containerMax"
-      onClick={() => { /* click-away closes tooltips (they stopPropagation internally) */ }}
-    >
-      <div className="topBar">
-        <div className="titleBlock">
-          <h1>EV Parlay Builder</h1>
-          <p>Devig vs sharp odds → true probability → compare to your odds (with optional boost)</p>
+    <div className="container">
+      <div className="toast" ref={toastRef} />
+
+      {/* TOP HEADER (clean) */}
+      <div className="headerRow">
+        <div>
+          <h1 className="h1">EV Parlay Builder</h1>
+          <div className="subhead">
+            Devig vs sharp odds → true probability → compare to your odds (with optional boost)
+          </div>
         </div>
 
-        <div className="topButtons">
-          <button className="pillBtn" onClick={copySummary}>Copy Results</button>
-          <button className="pillBtn" onClick={() => copyText(window.location.href)}>Copy Share Link</button>
-          <button className="primaryBtn" onClick={clearAll}>Clear All</button>
+        <div className="topActions">
+          <button
+            className="pill"
+            onClick={() => copyText(getShareUrlWithState(currentStateForShare()), "Share link copied")}
+            title="Copy a shareable link (includes all inputs)"
+          >
+            Copy Share Link
+          </button>
+          <button className="pill" onClick={() => setHelpOpen(true)}>
+            Help
+          </button>
         </div>
       </div>
 
-      <div className="banner">
-        <b>Required:</b> each leg needs Sharp Side A. Your odds are required in <b>PER-LEG</b> mode, or Total Parlay Odds in <b>TOTAL</b> mode. Sharp Side B is optional (we’ll assume the vig % if missing).
+      <div className="notice">
+        <b>Required:</b> each leg needs Sharp Side A. Your odds are required in <b>PER-LEG</b> mode, or Total
+        Parlay Odds in <b>TOTAL</b> mode. Sharp Side B is optional (we’ll assume the vig % if missing).
       </div>
 
       {/* INPUTS */}
-      <div className="card">
-        <div className="cardTitleRow">
+      <section className="panel">
+        <div className="panelHeader">
           <div>
-            <div className="cardTitleRow" style={{ marginBottom: 0 }}>
-              <h2 className="cardTitle">Inputs</h2>
-              <InfoTooltip title="What are “sharp books”?" >
-                “Sharp books” are books/exchanges whose prices are generally closer to the true market probability
-                (tighter lines, higher limits). You’re using their odds to estimate a “fair” probability, then comparing
-                your bet price to that fair probability.
-              </InfoTooltip>
-            </div>
-            <div className="smallNote">Set assumptions once, then build legs below.</div>
+            <div className="panelTitle">Inputs</div>
+            <div className="panelSub">Set assumptions once, then build legs below.</div>
           </div>
 
-          <div className="modeTabs">
+          <div className="segmented">
             <button
-              className={`modeTab ${mode === "perLeg" ? "modeTabActive" : ""}`}
-              onClick={() => setMode("perLeg")}
+              className={mode === "perleg" ? "segBtn segBtnActive" : "segBtn"}
+              onClick={() => setMode("perleg")}
             >
               Per-leg your odds
             </button>
             <button
-              className={`modeTab ${mode === "total" ? "modeTabActive" : ""}`}
+              className={mode === "total" ? "segBtn segBtnActive" : "segBtn"}
               onClick={() => setMode("total")}
             >
               Total parlay odds
             </button>
-
-            <div className="toggleWrap">
-              <div className="toggleLabel">Odds format</div>
-              <div className="toggleBtns">
-                <button
-                  className={`toggleBtn ${oddsFormat === "american" ? "toggleBtnActive" : ""}`}
-                  onClick={() => setOddsFormat("american")}
-                  type="button"
-                >
-                  American
-                </button>
-                <button
-                  className={`toggleBtn ${oddsFormat === "decimal" ? "toggleBtnActive" : ""}`}
-                  onClick={() => setOddsFormat("decimal")}
-                  type="button"
-                >
-                  Decimal
-                </button>
-              </div>
-            </div>
           </div>
         </div>
 
-        <div className="grid3">
-          <div>
-            <div className="label">Assumed Vig % (if Sharp B missing)</div>
-            <input
-              className="input"
-              value={assumedVigPct}
-              onChange={(e) => setAssumedVigPct(e.target.value)}
-              placeholder="7"
-            />
-            <div className="hint">Used only when Sharp B is blank.</div>
+        <div className="gridInputs">
+          <div className="field">
+            <label>Assumed Vig % (if Sharp B missing)</label>
+            <input className="input" value={vigPct} onChange={(e) => setVigPct(e.target.value)} placeholder="7" />
           </div>
 
-          <div>
-            <div className="label">Stake ($)</div>
-            <input
-              className="input"
-              value={stake}
-              onChange={(e) => setStake(e.target.value)}
-              placeholder="10"
-            />
-            <div className="hint">EV $ is computed for this stake.</div>
+          <div className="field">
+            <label>Stake ($)</label>
+            <input className="input" value={stake} onChange={(e) => setStake(e.target.value)} placeholder="10" />
           </div>
 
-          <div>
-            <div className="label">Your Total Parlay Odds ({oddsFormat === "american" ? "American" : "Decimal"})</div>
+          <div className="field">
+            <label>{mode === "total" ? "Your Total Parlay Odds (American)" : "Total Parlay Odds"}</label>
             <input
-              className={`input ${mode !== "total" ? "inputDisabled" : ""} ${mode === "total" && !validation.totalOk && String(totalParlayOdds || "").trim() ? "inputInvalid" : ""}`}
-              value={totalParlayOdds}
-              onChange={(e) => setTotalParlayOdds(e.target.value)}
-              placeholder={placeholderTotal}
+              className="input"
+              value={mode === "total" ? totalOdds : ""}
+              onChange={(e) => setTotalOdds(e.target.value)}
+              placeholder={mode === "total" ? "Example: +300" : "(Calculated from leg odds)"}
               disabled={mode !== "total"}
             />
-            {mode === "total" && String(totalParlayOdds || "").trim() && !validation.totalOk ? (
-              <div className="hint hintError">Enter a valid total odds value.</div>
-            ) : (
-              <div className="hint">{mode === "total" ? "Required in TOTAL mode." : "Ignored in PER-LEG mode."}</div>
-            )}
           </div>
-        </div>
 
-        <div className="sectionSpacer" />
-
-        <div className="grid2">
-          <div>
-            <div className="label">Boost % (optional)</div>
+          <div className="field" style={{ gridColumn: "1 / span 2" }}>
+            <label>Boost % (optional)</label>
             <input
               className="input"
               value={boostPct}
               onChange={(e) => setBoostPct(e.target.value)}
               placeholder="Example: 20"
             />
-            <div className="hint">Applies to your payout (profit portion).</div>
           </div>
-          <div />
         </div>
-      </div>
 
-      <div className="sectionSpacer" />
+        {/* Tips dropdown (real, visible, styled) */}
+        <details className="tipBox">
+          <summary className="tipSummary">Tips (click)</summary>
+          <div className="tipBody">
+            <div style={{ marginBottom: 6 }}>
+              <b>Sharp books</b> are typically lower-vig, more efficient markets. We use them to estimate a truer
+              probability.
+            </div>
+            <div style={{ marginBottom: 6 }}>
+              If you have both Sharp A and Sharp B, we devig two-sided. If Sharp B is blank, we approximate using the
+              assumed vig above.
+            </div>
+            <div>
+              Profit boosts apply to the <b>profit portion</b>, not your full payout.
+            </div>
+            <div style={{ marginTop: 8 }}>
+              <button className="btn btnGhost" type="button" onClick={() => setHelpOpen(true)}>
+                What’s “sharp”? (more)
+              </button>
+            </div>
+          </div>
+        </details>
+      </section>
 
       {/* LEGS */}
-      <div className="card">
-        <div className="cardTitleRow">
+      <section className="panel">
+        <div className="panelHeader">
           <div>
-            <h2 className="cardTitle">Legs</h2>
-            <div className="smallNote">
-              Sharp A required. Sharp B optional. Your odds required in per-leg mode. Label is optional.
+            <div className="panelTitle">Legs</div>
+            <div className="panelSub">
+              Sharp A required. Sharp B optional.{" "}
+              {mode === "perleg" ? "Your odds required in per-leg mode." : "Your odds ignored in total mode."}
             </div>
-
-            {(validation.anyMissingSharpA || validation.anyBadSharpB || validation.anyMissingYour) ? (
-              <div className="hint hintWarn" style={{ marginTop: 8 }}>
-                Heads up: some inputs are missing/invalid — results may show “—” until fixed.
-              </div>
-            ) : null}
           </div>
 
-          <div className="topButtons">
-            <button className="pillBtn" onClick={clearLegs}>Clear Legs</button>
-            <button className="primaryBtn" onClick={addLeg}>+ Add Leg</button>
+          <div className="btnRow">
+            <button className="btn" onClick={clearLegs}>
+              Clear Legs
+            </button>
           </div>
         </div>
 
-        {/* Desktop header row */}
-        <div className="legsHeaderRow">
+        <div className="legsHeaderGrid">
           <div>#</div>
           <div>Label</div>
           <div>Sharp Side A</div>
           <div>Sharp Side B</div>
-          <div>Your Odds {mode === "total" ? "(ignored)" : ""}</div>
+          <div>{mode === "perleg" ? "Your Odds" : "Your Odds (ignored)"}</div>
           <div>Leg True Prob</div>
           <div>Leg Fair Odds</div>
-          <div>Remove</div>
         </div>
 
-        {computed.legComputed.map((l, idx) => {
-          const canEditYourOdds = mode === "perLeg";
-          const fairTxt = formatOdds(l.fairOddsA);
-          const trueTxt = l.trueProb === null ? "—" : formatPct(l.trueProb);
-
-          const errs = validation.legErrors[idx] ?? { sharpAOk: true, sharpBOk: true, yourOk: true };
-
+        {legs.map((leg, idx) => {
+          const calc = legCalcs[idx];
           return (
-            <div key={l.id} className="legRow">
-              <div className="legRowGrid">
-                <div className="legNum">{idx + 1}</div>
+            <div key={leg.id} className="legRowGrid">
+              <div className="legIndex">{idx + 1}</div>
 
-                {/* Label */}
-                <div>
-                  <div className="label">Label</div>
-                  <input
-                    className="input"
-                    value={l.label}
-                    onChange={(e) => {
-                      const v = e.target.value;
-                      setLegs(prev => prev.map(x => x.id === l.id ? { ...x, label: v } : x));
-                    }}
-                    placeholder="Optional (e.g., Knicks ML)"
-                  />
-                  <div className="hint">Optional. For your own tracking.</div>
-                </div>
+              <input
+                className="input"
+                value={leg.label}
+                onChange={(e) =>
+                  setLegs((prev) => prev.map((x) => (x.id === leg.id ? { ...x, label: e.target.value } : x)))
+                }
+                placeholder="Optional (e.g., Knicks ML)"
+              />
 
-                {/* On mobile we still render in this grid; CSS collapses to stacked */}
-                <div className="legMobileInputs2">
-                  <div>
-                    <div className="label">Sharp A</div>
-                    <input
-                      className={`input ${!errs.sharpAOk && String(l.sharpA || "").trim() ? "inputInvalid" : ""}`}
-                      value={l.sharpA}
-                      onChange={(e) => {
-                        const v = e.target.value;
-                        setLegs(prev => prev.map(x => x.id === l.id ? { ...x, sharpA: v } : x));
-                      }}
-                      placeholder={placeholderOdds}
-                    />
-                    {!errs.sharpAOk && String(l.sharpA || "").trim() ? (
-                      <div className="hint hintError">Invalid odds.</div>
-                    ) : (
-                      <div className="hint">Required.</div>
-                    )}
-                  </div>
+              <input
+                className="input"
+                value={leg.sharpA}
+                onChange={(e) =>
+                  setLegs((prev) => prev.map((x) => (x.id === leg.id ? { ...x, sharpA: e.target.value } : x)))
+                }
+                placeholder="Example: -110"
+              />
 
-                  <div>
-                    <div className="label">Sharp B (optional)</div>
-                    <input
-                      className={`input ${!errs.sharpBOk ? "inputInvalid" : ""}`}
-                      value={l.sharpB}
-                      onChange={(e) => {
-                        const v = e.target.value;
-                        setLegs(prev => prev.map(x => x.id === l.id ? { ...x, sharpB: v } : x));
-                      }}
-                      placeholder={placeholderOdds}
-                    />
-                    {!errs.sharpBOk ? (
-                      <div className="hint hintError">Invalid odds (or leave blank).</div>
-                    ) : (
-                      <div className="hint">Optional.</div>
-                    )}
-                  </div>
-                </div>
+              <input
+                className="input"
+                value={leg.sharpB}
+                onChange={(e) =>
+                  setLegs((prev) => prev.map((x) => (x.id === leg.id ? { ...x, sharpB: e.target.value } : x)))
+                }
+                placeholder="Optional: +100"
+              />
 
-                <div className="legMobileInputs1">
-                  <div>
-                    <div className="label">Your Odds {mode === "total" ? "(ignored)" : ""}</div>
-                    <input
-                      className={`input ${!canEditYourOdds ? "inputDisabled" : ""} ${canEditYourOdds && !errs.yourOk && String(l.yourOdds || "").trim() ? "inputInvalid" : ""}`}
-                      value={l.yourOdds}
-                      onChange={(e) => {
-                        const v = e.target.value;
-                        setLegs(prev => prev.map(x => x.id === l.id ? { ...x, yourOdds: v } : x));
-                      }}
-                      placeholder={mode === "total" ? "Ignored in TOTAL mode" : placeholderYour}
-                      disabled={!canEditYourOdds}
-                    />
-                    {canEditYourOdds ? (
-                      (!errs.yourOk && String(l.yourOdds || "").trim()
-                        ? <div className="hint hintError">Invalid odds.</div>
-                        : <div className="hint">Required in PER-LEG mode.</div>
-                      )
-                    ) : (
-                      <div className="hint">Ignored in TOTAL mode.</div>
-                    )}
-                  </div>
-                </div>
+              <input
+                className="input"
+                value={leg.your}
+                onChange={(e) =>
+                  setLegs((prev) => prev.map((x) => (x.id === leg.id ? { ...x, your: e.target.value } : x)))
+                }
+                placeholder={mode === "perleg" ? "Example: +120" : "Ignored in TOTAL mode"}
+                disabled={mode !== "perleg"}
+              />
 
-                <div>
-                  <div className="metricBig">{trueTxt}</div>
-                  <div className="metricSub">{l.note || ""}</div>
-                </div>
-
-                <div>
-                  <div className="metricBig">{fairTxt}</div>
-                  <div className="metricSub">Fair odds</div>
-                </div>
-
-                <div>
-                  <button className="removeBtn" onClick={() => removeLeg(l.id)}>Remove</button>
-                </div>
+              <div>
+                <div className="kpiBig">{fmtPct(calc?.pTrue)}</div>
+                <div className="miniNote">{calc?.method || "—"}</div>
               </div>
+
+              <div>
+                <div className="kpiBig">{fmtAmerican(calc?.fairA)}</div>
+                <div className="miniNote">Fair odds</div>
+              </div>
+
+              <button className="btn btnDanger" onClick={() => removeLeg(leg.id)}>
+                Remove
+              </button>
             </div>
           );
         })}
 
-        <div className="tipRow">
+        {/* Add Leg BELOW the last leg (your request) */}
+        <div className="legsFooterActions">
+          <div className="legsFooterActionsLeft" />
+          <button className="btn btnPrimary" onClick={addLeg}>
+            + Add Leg
+          </button>
+        </div>
+
+        <div className="miniNote" style={{ marginTop: 10 }}>
           Tip: You can use this as a 1-leg calculator by removing down to one leg.
         </div>
-      </div>
+      </section>
 
-      <div className="sectionSpacer" />
+      {/* RESULTS */}
+      <section className="panel">
+        <div className="resultsHeaderRow">
+          <div>
+            <div className="panelTitle">Results</div>
+            <div className="panelSub">One clean copy button for the full results.</div>
+          </div>
 
-      {/* RESULTS (below legs) */}
-      <div className="card">
-        <div className="cardTitleRow">
-          <h2 className="cardTitle">Results</h2>
-          <button className="pillBtn" onClick={copySummary}>Copy All</button>
+          <div className="btnRow">
+            <button className="btn" onClick={() => copyText(buildResultsText(), "Results copied")}>
+              Copy Results
+            </button>
+            <button className="btn btnDanger" onClick={clearAll}>
+              Clear All
+            </button>
+          </div>
         </div>
 
         <div className="resultsGrid">
-          <ResultTile
-            labelNode="True Parlay Probability"
-            value={formatPct(computed.trueParlayProb)}
-            onCopy={() => copyText(formatPct(computed.trueParlayProb))}
-          />
-          <ResultTile
-            labelNode={`Fair Parlay Odds (${oddsFormat === "american" ? "American" : "Decimal"})`}
-            value={formatOdds(computed.fairParlayAmerican)}
-            onCopy={() => copyText(formatOdds(computed.fairParlayAmerican))}
-          />
-          <ResultTile
-            labelNode={`Your Parlay Odds (${oddsFormat === "american" ? "American" : "Decimal"})`}
-            value={formatOdds(computed.yourParlayAmerican)}
-            onCopy={() => copyText(formatOdds(computed.yourParlayAmerican))}
-          />
-          <ResultTile
-            labelNode={`Boosted Parlay Odds (${oddsFormat === "american" ? "American" : "Decimal"})`}
-            value={formatOdds(computed.boostedAmerican)}
-            onCopy={() => copyText(formatOdds(computed.boostedAmerican))}
-          />
+          <div className="resultCard">
+            <div className="resultLabel">True Parlay Probability</div>
+            <div className="resultValue">{fmtPct(results.trueParlayProb)}</div>
+          </div>
 
-          <ResultTile
-            labelNode={
-              <span style={{ display: "inline-flex", alignItems: "center", gap: 8 }}>
-                Break-even Probability
-                <InfoTooltip title="Break-even probability">
-                  This is the minimum win probability needed for your bet price (including boost) to have EV = 0.
-                  <br /><br />
-                  If your “True Parlay Probability” is higher than break-even, the bet is +EV.
-                </InfoTooltip>
-              </span>
-            }
-            value={formatPct(computed.breakEvenProb)}
-            onCopy={() => copyText(formatPct(computed.breakEvenProb))}
-          />
+          <div className="resultCard">
+            <div className="resultLabel">Fair Parlay Odds</div>
+            <div className="resultValue">{fmtAmerican(results.fairParlayAmerican)}</div>
+          </div>
 
-          <ResultTile
-            labelNode={`EV $ (stake: $${stake || "—"})`}
-            value={computed.evDollar === null ? "—" : `$${computed.evDollar.toFixed(2)}`}
-            tone={computed.evDollar !== null && computed.evDollar > 0 ? "good" : computed.evDollar !== null && computed.evDollar < 0 ? "bad" : "neutral"}
-            onCopy={() => copyText(computed.evDollar === null ? "—" : `$${computed.evDollar.toFixed(2)}`)}
-          />
+          <div className="resultCard">
+            <div className="resultLabel">Your Parlay Odds</div>
+            <div className="resultValue">{fmtAmerican(results.yourParlayAmerican)}</div>
+          </div>
 
-          <ResultTile
-            labelNode="EV %"
-            value={computed.evPct === null ? "—" : `${computed.evPct.toFixed(2)}%`}
-            tone={computed.evPct !== null && computed.evPct > 0 ? "good" : computed.evPct !== null && computed.evPct < 0 ? "bad" : "neutral"}
-            onCopy={() => copyText(computed.evPct === null ? "—" : `${computed.evPct.toFixed(2)}%`)}
-          />
+          <div className="resultCard">
+            <div className="resultLabel">Boosted Parlay Odds</div>
+            <div className="resultValue">{fmtAmerican(results.boostedAmerican)}</div>
+          </div>
 
-          <ResultTile
-            labelNode="Status"
-            value={computed.status}
-            tone={computed.status === "+EV" ? "good" : computed.status === "-EV" ? "bad" : computed.status === "Enter inputs to calculate" ? "warn" : "neutral"}
-            onCopy={() => copyText(computed.status)}
-          />
+          <div className="resultCard">
+            <div className="resultLabel">Break-even Probability</div>
+            <div className="resultValue">{fmtPct(results.breakEvenProb)}</div>
+          </div>
+
+          <div className={`resultCard ${results.evDollars === null ? "" : results.evDollars > 0 ? "toneGood" : "toneBad"}`}>
+            <div className="resultLabel">EV $ (stake: ${Math.round(results.stakeNum ?? 0)})</div>
+            <div className="resultValue">{fmtMoney(results.evDollars)}</div>
+          </div>
+
+          <div className={`resultCard ${toneClass}`}>
+            <div className="resultLabel">EV %</div>
+            <div className="resultValue">
+              {results.evPct === null ? "—" : `${(results.evPct * 100).toFixed(2)}%`}
+            </div>
+          </div>
+
+          <div className={`resultCard ${results.status === "+EV" ? "toneGood" : results.status === "-EV" ? "toneBad" : ""}`}>
+            <div className="resultLabel">Status</div>
+            <div className="resultValue">{results.status}</div>
+          </div>
         </div>
 
-        <div className="tipRow" style={{ marginTop: 14 }}>
+        <div className="miniNote" style={{ marginTop: 14 }}>
           This tool is for informational purposes only. Always double-check inputs.
         </div>
-      </div>
+      </section>
+
+      {/* HELP MODAL */}
+      {helpOpen ? (
+        <div
+          onMouseDown={() => setHelpOpen(false)}
+          style={{
+            position: "fixed",
+            inset: 0,
+            background: "rgba(0,0,0,0.55)",
+            display: "flex",
+            alignItems: "center",
+            justifyContent: "center",
+            padding: 16,
+            zIndex: 50,
+          }}
+        >
+          <div
+            onMouseDown={(e) => e.stopPropagation()}
+            style={{
+              maxWidth: 720,
+              width: "100%",
+              border: "1px solid var(--border)",
+              background: "rgba(10,18,32,0.92)",
+              borderRadius: 18,
+              boxShadow: "var(--shadow)",
+              padding: 18,
+            }}
+          >
+            <div style={{ fontWeight: 900, fontSize: 18, marginBottom: 10 }}>Help / What are “Sharp Books”?</div>
+            <div style={{ color: "rgba(255,255,255,0.78)", lineHeight: 1.5, fontSize: 14 }}>
+              <p>
+                <b>“Sharp” books</b> are sportsbooks/markets that tend to have <b>tighter pricing</b> (lower vig,
+                faster line efficiency). We use their odds to estimate a <b>truer probability</b>, then compare that to
+                the odds you’re getting.
+              </p>
+              <p>
+                <b>Sharp Side A</b> is the side you want to bet. If you provide <b>Sharp Side B</b> as the opposite
+                side, the calculator can <b>devig two-sided</b> by normalizing implied probabilities.
+              </p>
+              <p>
+                If you don’t have Sharp Side B, we approximate by assuming an <b>overround</b> of <b>(1 + assumed vig)</b>{" "}
+                and reduce Sharp A’s implied probability accordingly.
+              </p>
+              <p>
+                <b>Boost %</b> applies to the <b>profit portion only</b> (common “profit boost” structure).
+              </p>
+            </div>
+            <div style={{ display: "flex", justifyContent: "flex-end", marginTop: 12 }}>
+              <button className="btn btnPrimary" onClick={() => setHelpOpen(false)}>
+                Got it
+              </button>
+            </div>
+          </div>
+        </div>
+      ) : null}
     </div>
   );
 }

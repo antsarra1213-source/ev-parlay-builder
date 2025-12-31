@@ -1,3 +1,5 @@
+import "./globals.css";
+
 export const metadata = {
   title: "EV Parlay App",
   description: "Parlay EV calculator with devig vs sharp books",
@@ -32,9 +34,7 @@ export default function RootLayout({ children }) {
           }
           a{ color:var(--link); text-decoration:none; }
           a:hover{ text-decoration:underline; }
-          input, select, button{
-            font: inherit;
-          }
+          input, select, button{ font: inherit; }
         `}</style>
         {children}
       </body>
